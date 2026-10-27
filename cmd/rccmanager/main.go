@@ -48,6 +48,7 @@ func main() {
 	defer stop()
 
 	go g.RunReaper(ctx)
+	go g.RunPlayerCounts(ctx)
 	go q.Run(ctx)
 
 	httpSrv := &http.Server{

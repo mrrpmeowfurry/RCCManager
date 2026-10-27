@@ -20,6 +20,7 @@ import (
 type Server struct {
 	JobID     string    `json:"jobId"`
 	PlaceID   int64     `json:"placeId"`
+	Key       string    `json:"key,omitempty"`
 	Port      int       `json:"port"`
 	Address   string    `json:"address"`
 	Ready     bool      `json:"ready"`
@@ -45,6 +46,9 @@ type Manager struct {
 	servers map[string]*Server
 	rccUp   bool
 	rccErr  string
+
+	// Background polling and the reaper share count refreshes.
+	playersMu sync.Mutex
 
 	// one state file write at a time
 	saveMu sync.Mutex
@@ -110,18 +114,24 @@ func (m *Manager) RCCURL() string {
 	return m.rcc.URL
 }
 
-func (m *Manager) byPlace(placeID int64) *Server {
+// a key makes a private job (vip-<id>, rsv-<id>), "" is the public one
+type StartOpts struct {
+	Key     string
+	OwnerID int64
+}
+
+func (m *Manager) find(placeID int64, key string) *Server {
 	for _, s := range m.servers {
-		if s.PlaceID == placeID {
+		if s.PlaceID == placeID && s.Key == key {
 			return s
 		}
 	}
 	return nil
 }
 
-func (m *Manager) FindOrCreate(ctx context.Context, placeID int64) (Server, error) {
+func (m *Manager) FindOrCreate(ctx context.Context, placeID int64, opts StartOpts) (Server, error) {
 	m.mu.Lock()
-	if s := m.byPlace(placeID); s != nil {
+	if s := m.find(placeID, opts.Key); s != nil {
 		s.LastSeen = time.Now()
 		out := *s
 		m.mu.Unlock()
@@ -134,9 +144,14 @@ func (m *Manager) FindOrCreate(ctx context.Context, placeID int64) (Server, erro
 		return Server{}, err
 	}
 	now := time.Now()
+	prefix := "place" + strconv.FormatInt(placeID, 10) + "-"
+	if opts.Key != "" {
+		prefix += opts.Key + "-"
+	}
 	s := &Server{
-		JobID:     "place" + strconv.FormatInt(placeID, 10) + "-" + rcc.RandomHex(8),
+		JobID:     prefix + rcc.RandomHex(8),
 		PlaceID:   placeID,
+		Key:       opts.Key,
 		Port:      port,
 		Address:   m.cfg.SitePublicAddress,
 		StartedAt: now,
@@ -156,7 +171,7 @@ func (m *Manager) FindOrCreate(ctx context.Context, placeID int64) (Server, erro
 	octx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, err = m.rcc.OpenJob(octx, s.JobID, "gameserver", script, m.cfg.Lease,
-		rcc.Number(placeID), rcc.Number(int64(port)), rcc.String(m.cfg.SiteInternalURL))
+		rcc.Number(placeID), rcc.Number(int64(port)), rcc.String(m.cfg.SiteInternalURL), rcc.String(opts.Key), rcc.Number(opts.OwnerID))
 	if err != nil {
 		m.forget(s.JobID)
 		return Server{}, err
@@ -257,44 +272,64 @@ func (m *Manager) forget(jobID string) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) Players(ctx context.Context, placeIDs []int64) map[int64]int {
+// Cached counts include every job of the place, private ones too.
+func (m *Manager) Players(placeIDs []int64) map[int64]int {
 	out := make(map[int64]int, len(placeIDs))
-	var stale []*Server
-
-	m.mu.Lock()
 	for _, id := range placeIDs {
 		out[id] = 0
-		if s := m.byPlace(id); s != nil {
-			out[id] = s.Players
-			if time.Since(s.PlayersAt) > m.cfg.PlayerCountTTL {
-				stale = append(stale, s)
-			}
-		}
 	}
-	m.mu.Unlock()
 
-	var wg sync.WaitGroup
-	results := make([]int, len(stale))
-	oks := make([]bool, len(stale))
-	for i, s := range stale {
-		wg.Add(1)
-		go func(i int, s *Server) {
-			defer wg.Done()
-			n, err := m.refreshPlayers(ctx, s.JobID)
-			results[i], oks[i] = n, err == nil
-		}(i, s)
-	}
-	wg.Wait()
-
-	for i, s := range stale {
-		if oks[i] {
-			out[s.PlaceID] = results[i]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.servers {
+		if _, ok := out[s.PlaceID]; ok {
+			out[s.PlaceID] += s.Players
 		}
 	}
 	return out
 }
 
-func (m *Manager) refreshPlayers(ctx context.Context, jobID string) (int, error) {
+// HTTP reads never wait for RCC, even while OpenJob or a render holds its slot.
+func (m *Manager) RunPlayerCounts(ctx context.Context) {
+	interval := m.cfg.PlayerCountTTL
+	if interval <= 0 {
+		interval = time.Second
+	}
+	t := time.NewTimer(0)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		for _, s := range m.List() {
+			if ctx.Err() != nil {
+				return
+			}
+			if s.Ready {
+				// A failed refresh keeps the last successful count.
+				_, _ = m.refreshPlayers(ctx, s.JobID, interval)
+			}
+		}
+		t.Reset(interval)
+	}
+}
+
+func (m *Manager) refreshPlayers(ctx context.Context, jobID string, maxAge time.Duration) (int, error) {
+	m.playersMu.Lock()
+	defer m.playersMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s, ok := m.Get(jobID)
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if maxAge > 0 && time.Since(s.PlayersAt) < maxAge {
+		return s.Players, nil
+	}
+
 	ectx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	vals, err := m.rcc.Execute(ectx, jobID, "players", `return #game:GetService("Players"):GetPlayers()`)
@@ -361,7 +396,7 @@ func (m *Manager) reap(ctx context.Context) {
 			if now.Sub(s.StartedAt) > 45*time.Second {
 				gone = append(gone, id)
 			}
-		case now.Sub(s.LastSeen) > m.cfg.IdleTimeout:
+		case s.Ready && now.Sub(s.LastSeen) > m.cfg.IdleTimeout:
 			idle = append(idle, id)
 		}
 		if liveSet[id] && now.Sub(s.LeasedAt) > m.cfg.Lease/2 {
@@ -376,7 +411,7 @@ func (m *Manager) reap(ctx context.Context) {
 
 	for _, id := range idle {
 		// ask first, dont kick people on a blip
-		n, err := m.refreshPlayers(ctx, id)
+		n, err := m.refreshPlayers(ctx, id, 0)
 		if err == nil && n == 0 {
 			log.Printf("%s is empty, closing it", id)
 			_ = m.Close(ctx, id)

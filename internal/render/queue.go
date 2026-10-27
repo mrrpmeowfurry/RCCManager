@@ -24,11 +24,12 @@ const (
 	Avatar Kind = "avatar"
 	Place  Kind = "place"
 	Item   Kind = "item"
+	Outfit Kind = "outfit"
 )
 
 func ParseKind(s string) (Kind, bool) {
 	switch k := Kind(s); k {
-	case Avatar, Place, Item:
+	case Avatar, Place, Item, Outfit:
 		return k, true
 	}
 	return "", false
@@ -44,13 +45,15 @@ const (
 )
 
 type Job struct {
-	Kind       Kind      `json:"kind"`
-	ID         int64     `json:"id"`
-	Status     Status    `json:"status"`
-	Error      string    `json:"error,omitempty"`
-	Files      []string  `json:"files,omitempty"`
-	QueuedAt   time.Time `json:"queuedAt"`
-	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	Kind       Kind           `json:"kind"`
+	ID         int64          `json:"id"`
+	Status     Status         `json:"status"`
+	Error      string         `json:"error,omitempty"`
+	Files      []string       `json:"files,omitempty"`
+	Outputs    []renderedFile `json:"outputs,omitempty"`
+	Warnings   []string       `json:"warnings,omitempty"`
+	QueuedAt   time.Time      `json:"queuedAt"`
+	FinishedAt time.Time      `json:"finishedAt,omitempty"`
 
 	url   string
 	r15   bool
@@ -135,6 +138,8 @@ func (q *Queue) defaultURL(kind Kind, id int64) string {
 		return q.cfg.SiteInternalURL + "/Asset/CharacterFetch.ashx?userId=" + strconv.FormatInt(id, 10)
 	case Place:
 		return q.cfg.SiteInternalURL + "/asset/?id=" + strconv.FormatInt(id, 10)
+	case Outfit:
+		return q.cfg.SiteInternalURL + "/Asset/CharacterFetch.ashx?outfitId=" + strconv.FormatInt(id, 10)
 	}
 	// items need the asset url from the site, item id != asset id
 	return ""
@@ -149,6 +154,8 @@ func (q *Queue) Job(kind Kind, id int64) (Job, bool) {
 	}
 	out := *j
 	out.Files = append([]string(nil), j.Files...)
+	out.Outputs = append([]renderedFile(nil), j.Outputs...)
+	out.Warnings = append([]string(nil), j.Warnings...)
 	return out, true
 }
 
@@ -194,7 +201,7 @@ func (q *Queue) worker(ctx context.Context, c *rcc.Client) {
 		q.mu.Unlock()
 
 		start := time.Now()
-		files, err := q.render(ctx, c, j.Kind, j.ID, url, r15)
+		files, outputs, warnings, err := q.render(ctx, c, j.Kind, j.ID, url, r15)
 
 		q.mu.Lock()
 		j.FinishedAt = time.Now()
@@ -206,6 +213,8 @@ func (q *Queue) worker(ctx context.Context, c *rcc.Client) {
 			j.Status = Done
 			j.Error = ""
 			j.Files = files
+			j.Outputs = outputs
+			j.Warnings = warnings
 			log.Printf("rendered %s %d in %s", j.Kind, j.ID, time.Since(start).Round(time.Millisecond))
 		}
 		if j.again {
@@ -237,7 +246,7 @@ func (q *Queue) sweep(ctx context.Context) {
 }
 
 // render everything before storing anything, no fresh body next to a stale head
-func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, url string, r15 bool) ([]string, error) {
+func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, url string, r15 bool) ([]string, []renderedFile, []string, error) {
 	idStr := strconv.FormatInt(id, 10)
 	site := q.cfg.SiteInternalURL
 
@@ -247,16 +256,17 @@ func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, 
 		mime string
 	}
 	var outs []out
+	var warnings []string
 
 	switch kind {
 	case Avatar:
 		full, err := q.png(ctx, c, "avatar-"+idStr, avatarScript(site, id, url, avatarSize, avatarSize, false, r15), 60*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("full: %w", err)
+			return nil, nil, nil, fmt.Errorf("full: %w", err)
 		}
 		head, err := q.png(ctx, c, "headshot-"+idStr, avatarScript(site, id, url, headshotSize, headshotSize, true, r15), 60*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("headshot: %w", err)
+			return nil, nil, nil, fmt.Errorf("headshot: %w", err)
 		}
 		outs = []out{
 			{"avatars/" + idStr + ".png", full, "image/png"},
@@ -265,38 +275,51 @@ func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, 
 		// old builds have no OBJ export, the pngs still go out
 		if scene, err := q.json(ctx, c, "avatar3d-"+idStr, avatar3DScript(site, id, url, r15), 60*time.Second); err != nil {
 			log.Printf("no 3d for avatar %d: %v", id, err)
+			warnings = append(warnings, "no 3d: "+err.Error())
 		} else {
 			outs = append(outs, out{"avatars/" + idStr + "-3d.json", scene, "application/json"})
 		}
 
 	case Place:
+		// the game icon is the creator's own upload, a crop of this would just repeat the thumbnail
 		thumb, err := q.png(ctx, c, "thumb-"+idStr, placeScript(site, url, thumbW, thumbH, true), 120*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("thumbnail: %w", err)
-		}
-		icon, err := q.png(ctx, c, "icon-"+idStr, placeScript(site, url, iconSize, iconSize, true), 120*time.Second)
-		if err != nil {
-			return nil, fmt.Errorf("icon: %w", err)
+			return nil, nil, nil, fmt.Errorf("thumbnail: %w", err)
 		}
 		outs = []out{
 			{"thumbnails/" + idStr + ".png", thumb, "image/png"},
-			{"icons/" + idStr + ".png", icon, "image/png"},
 		}
 
 	case Item:
 		if url == "" {
-			return nil, errors.New("item render needs appearanceUrl (CharacterFetch.ashx?assetId=...)")
+			return nil, nil, nil, errors.New("item render needs appearanceUrl (CharacterFetch.ashx?assetId=...)")
 		}
 		png, err := q.png(ctx, c, "item-"+idStr, itemScript(site, url, itemSize, itemSize), 60*time.Second)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		outs = []out{
 			{"catalog/" + idStr + ".png", png, "image/png"},
 		}
+		if scene, err := q.json(ctx, c, "item3d-"+idStr, item3DScript(site, url), 60*time.Second); err != nil {
+			log.Printf("no 3d for item %d: %v", id, err)
+			warnings = append(warnings, "no 3d: "+err.Error())
+		} else {
+			outs = append(outs, out{"catalog/" + idStr + "-3d.json", scene, "application/json"})
+		}
+
+	// the outfit id is not a user id, the appearance url carries everything
+	case Outfit:
+		png, err := q.png(ctx, c, "outfit-"+idStr, avatarScript(site, 0, url, avatarSize, avatarSize, false, r15), 60*time.Second)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		outs = []out{
+			{"outfits/" + idStr + ".png", png, "image/png"},
+		}
 
 	default:
-		return nil, fmt.Errorf("unknown render kind %q", kind)
+		return nil, nil, nil, fmt.Errorf("unknown render kind %q", kind)
 	}
 
 	urls := make([]string, 0, len(outs))
@@ -304,7 +327,7 @@ func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, 
 	for _, o := range outs {
 		u, err := q.store.Put(ctx, o.key, o.data, o.mime)
 		if err != nil {
-			return nil, fmt.Errorf("store %s: %w", o.key, err)
+			return nil, nil, nil, fmt.Errorf("store %s: %w", o.key, err)
 		}
 		urls = append(urls, u)
 		files = append(files, renderedFile{
@@ -314,7 +337,7 @@ func (q *Queue) render(ctx context.Context, c *rcc.Client, kind Kind, id int64, 
 	}
 	// off the worker, a dead site must not hold up the next render
 	go q.notify(context.Background(), kind, id, files)
-	return urls, nil
+	return urls, files, warnings, nil
 }
 
 func (q *Queue) png(ctx context.Context, c *rcc.Client, name, script string, timeout time.Duration) ([]byte, error) {

@@ -1,4 +1,4 @@
-function start(placeId, port, url)
+function start(placeId, port, url, vipServerId, vipOwnerId)
 ------------------- UTILITY FUNCTIONS --------------------------
 
 
@@ -73,6 +73,12 @@ if url~=nil then
 	pcall(function() game:GetService("MarketplaceService"):SetPlayerOwnsAssetUrl(url .. "/ownership/hasAsset?userId=%d&assetId=%d") end)
 	
 	pcall(function() loadfile(url .. "/Game/LoadPlaceInfo.ashx?PlaceId=" .. placeId)() end)
+
+	-- after LoadPlaceInfo, it sets the owner back to 0
+	if vipServerId ~= nil and vipServerId ~= "" then
+		pcall(function() game:SetVIPServerId(vipServerId) end)
+		pcall(function() game:SetVIPServerOwnerId(vipOwnerId or 0) end)
+	end
 	
 	-- pcall(function() 
 	--			if access then

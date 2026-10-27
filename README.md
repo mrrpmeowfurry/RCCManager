@@ -25,6 +25,7 @@ cp .env.example .env
 | `PORT_MIN`, `PORT_MAX` | UDP ports for game servers |
 | `LISTEN` | Where the API listens |
 | `PASSWORD` | Same as `RCCMANAGER_PASSWORD` on the site |
+| `PLAYER_COUNT_TTL` | Player count refresh interval, default `10s` |
 
 > [!NOTE]
 > RCCService is ipv4 only, use `127.0.0.1` and not `localhost`.
@@ -34,6 +35,8 @@ Then just run it. If something is missing in `.env` it tells you.
 ## API Reference
 
 Everything needs `Authorization: Bearer <PASSWORD>`.
+
+`GET /servers` and `GET /players` return cached player counts immediately. Counts refresh in the background for ready servers every `PLAYER_COUNT_TTL`; failed refreshes keep the last successful count.
 
 #### Start a server
 

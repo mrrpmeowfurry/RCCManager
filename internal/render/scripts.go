@@ -9,7 +9,6 @@ const (
 	avatarSize     = 420
 	headshotSize   = 150
 	thumbW, thumbH = 768, 432
-	iconSize       = 256
 	itemSize       = 420
 )
 
@@ -100,10 +99,19 @@ func placeScript(siteURL, placeURL string, w, h int, hideSky bool) string {
 
 // no game:GetObjects in this build, so CharacterFetch.ashx?assetId= + LoadCharacter(false) wears it
 func itemScript(siteURL, appearanceURL string, w, h int) string {
+	return itemSetup(siteURL, appearanceURL) +
+		`return game:GetService("ThumbnailGenerator"):Click("PNG", ` + strconv.Itoa(w) + `, ` + strconv.Itoa(h) + `, true, false)`
+}
+
+func item3DScript(siteURL, appearanceURL string) string {
+	return itemSetup(siteURL, appearanceURL) +
+		`return game:GetService("ThumbnailGenerator"):Click("OBJ", 1, 1, true, false)`
+}
+
+func itemSetup(siteURL, appearanceURL string) string {
 	return preamble(siteURL) +
 		`local player = game:GetService("Players"):CreateLocalPlayer(0)` + "\n" +
 		`player.CharacterAppearance = ` + luaString(appearanceURL) + "\n" +
 		`player.CanLoadCharacterAppearance = true` + "\n" +
-		loadCharacter +
-		`return game:GetService("ThumbnailGenerator"):Click("PNG", ` + strconv.Itoa(w) + `, ` + strconv.Itoa(h) + `, true, false)`
+		loadCharacter
 }

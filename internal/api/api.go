@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"rccmanager/internal/rcc"
 	"rccmanager/internal/render"
 )
+
+var privateKey = regexp.MustCompile(`^(vip|rsv)-[0-9]{1,12}$`)
 
 type Server struct {
 	cfg     *config.Config
@@ -47,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /render/avatar/{id}", s.enqueueRender(render.Avatar, "appearanceUrl"))
 	mux.HandleFunc("POST /render/place/{id}", s.enqueueRender(render.Place, "placeUrl"))
 	mux.HandleFunc("POST /render/item/{id}", s.enqueueRender(render.Item, "appearanceUrl"))
+	mux.HandleFunc("POST /render/outfit/{id}", s.enqueueRender(render.Outfit, "appearanceUrl"))
 	mux.HandleFunc("GET /render/{kind}/{id}", s.renderStatus)
 
 	mux.HandleFunc("GET /health", s.health)
@@ -122,6 +126,7 @@ func pathID(r *http.Request, name string) (int64, bool) {
 type serverView struct {
 	JobID     string    `json:"jobId"`
 	PlaceID   int64     `json:"placeId"`
+	Key       string    `json:"key"`
 	Port      int       `json:"port"`
 	Address   string    `json:"address"`
 	Ready     bool      `json:"ready"`
@@ -133,6 +138,7 @@ func view(s games.Server) serverView {
 	return serverView{
 		JobID:     s.JobID,
 		PlaceID:   s.PlaceID,
+		Key:       s.Key,
 		Port:      s.Port,
 		Address:   s.Address,
 		Ready:     s.Ready,
@@ -147,7 +153,24 @@ func (s *Server) findOrCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad placeId")
 		return
 	}
-	srv, err := s.games.FindOrCreate(r.Context(), placeID)
+	var body struct {
+		Key     string `json:"key"`
+		OwnerID int64  `json:"ownerId"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "bad json body")
+			return
+		}
+	}
+	if body.Key != "" && !privateKey.MatchString(body.Key) {
+		writeError(w, http.StatusBadRequest, "bad key")
+		return
+	}
+	srv, err := s.games.FindOrCreate(r.Context(), placeID, games.StartOpts{
+		Key:     body.Key,
+		OwnerID: body.OwnerID,
+	})
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -166,17 +189,9 @@ func (s *Server) getServer(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listServers(w http.ResponseWriter, r *http.Request) {
 	list := s.games.List()
-	// admin page wants fresh counts
-	ids := make([]int64, 0, len(list))
-	for _, srv := range list {
-		ids = append(ids, srv.PlaceID)
-	}
-	counts := s.games.Players(r.Context(), ids)
 	out := make([]serverView, 0, len(list))
 	for _, srv := range list {
-		v := view(srv)
-		v.Players = counts[srv.PlaceID]
-		out = append(out, v)
+		out = append(out, view(srv))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -203,7 +218,7 @@ func (s *Server) players(w http.ResponseWriter, r *http.Request) {
 		}
 		ids = append(ids, n)
 	}
-	counts := s.games.Players(r.Context(), ids)
+	counts := s.games.Players(ids)
 	out := make(map[string]int, len(counts))
 	for id, n := range counts {
 		out[strconv.FormatInt(id, 10)] = n
@@ -259,6 +274,12 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(j.Files) > 0 {
 		out["files"] = j.Files
+	}
+	if len(j.Outputs) > 0 {
+		out["outputs"] = j.Outputs
+	}
+	if len(j.Warnings) > 0 {
+		out["warnings"] = j.Warnings
 	}
 	writeJSON(w, http.StatusOK, out)
 }
